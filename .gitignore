@@ -129,6 +129,8 @@ parts/
 prime/
 stage/
 *.snap
+*.xlog
+*.vylog
 ftp.log
 sftp.log
 ftpscript.txt
