@@ -121,16 +121,20 @@ result
       - HEADER:
           type: INSERT
         BODY:
-          tuple: [2, {0: 2, 1: 0, 3: [], 4: [], 8: true}]
+          tuple: [2, {0: 2, 1: 1, 3: [], 4: [], 8: true}]
       - HEADER:
           type: INSERT
         BODY:
-          tuple: [5, {1: 0, 2: 0, 9: 4, 10: 5, 11: true}]
+          tuple: [5, {1: 1, 2: 0, 9: 4, 10: 5, 11: true}]
       - HEADER:
           lsn: 5
           type: INSERT
         BODY:
-          tuple: [5, {1: 0, 2: 1, 9: 6, 10: 8, 11: false}]
+          tuple: [5, {1: 1, 2: 1, 9: 6, 10: 8, 11: false}]
+      - HEADER:
+          type: INSERT
+        BODY:
+          tuple: [2, {0: 2, 1: 0, 3: [], 4: [], 8: false}]
       - HEADER:
           lsn: 8
           type: INSERT
@@ -142,7 +146,7 @@ result
           type: INSERT
           timestamp: <timestamp>
         BODY:
-          tuple: [5, {1: 0, 2: 2, 9: 9, 10: 11, 11: false}]
+          tuple: [5, {1: 1, 2: 2, 9: 9, 10: 11, 11: false}]
   - - 00000000000000000001.index
     - - HEADER:
           type: RUNINFO
