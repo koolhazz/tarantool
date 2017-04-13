@@ -386,9 +386,9 @@ struct vy_range {
 	/* Size of data stored on disk (sum of run->info.size). */
 	uint64_t size;
 	/** Total amount of memory used by this range (sum of mem->used). */
-	size_t used;
+	size_t mem_used;
 	/** Minimal in-memory lsn (min over mem->min_lsn). */
-	int64_t min_lsn;
+	int64_t mem_min_lsn;
 	/** New run created for dump/compaction. */
 	struct vy_run *new_run;
 	/**
@@ -589,7 +589,7 @@ struct vy_index {
 	/** Size of data stored on disk. */
 	uint64_t size;
 	/** Amount of memory used by in-memory indexes. */
-	uint64_t used;
+	uint64_t mem_used;
 	/** Histogram of number of runs in range. */
 	struct histogram *run_hist;
 	/**
@@ -1322,14 +1322,14 @@ vy_run_record_gc(const char *vinyl_dir, const struct vy_log_record *record)
 static void
 vy_index_acct_mem(struct vy_index *index, struct vy_mem *mem)
 {
-	index->used += mem->used;
+	index->mem_used += mem->used;
 	index->stmt_count += mem->tree.size;
 }
 
 static void
 vy_index_unacct_mem(struct vy_index *index, struct vy_mem *mem)
 {
-	index->used -= mem->used;
+	index->mem_used -= mem->used;
 	index->stmt_count -= mem->tree.size;
 }
 
@@ -2356,7 +2356,7 @@ vy_range_new(struct vy_index *index, int64_t id,
 	}
 	rlist_create(&range->runs);
 	rlist_create(&range->sealed);
-	range->min_lsn = INT64_MAX;
+	range->mem_min_lsn = INT64_MAX;
 	range->index = index;
 	range->in_dump.pos = UINT32_MAX;
 	range->in_compact.pos = UINT32_MAX;
@@ -2430,21 +2430,22 @@ vy_range_rotate_mem(struct vy_range *range)
  * the scheduler. Called after successful dump or compaction.
  */
 static void
-vy_range_dump_mems(struct vy_range *range, struct vy_scheduler *scheduler,
-		   int64_t dump_lsn)
+vy_range_gc_mem(struct vy_range *range, struct vy_scheduler *scheduler,
+		int64_t dump_lsn)
 {
 	struct vy_mem *mem, *tmp;
 
-	range->used = range->mem->used;
-	range->min_lsn = range->mem->min_lsn;
+	range->mem_used = range->mem->used;
+	range->mem_min_lsn = range->mem->min_lsn;
 	rlist_foreach_entry_safe(mem, &range->sealed, in_sealed, tmp) {
 		if (mem->min_lsn <= dump_lsn) {
 			rlist_del_entry(mem, in_sealed);
 			vy_scheduler_mem_dumped(scheduler, mem);
 			vy_mem_delete(mem);
 		} else {
-			range->used += mem->used;
-			range->min_lsn = MIN(range->min_lsn, mem->min_lsn);
+			range->mem_used += mem->used;
+			range->mem_min_lsn = MIN(range->mem_min_lsn,
+						 mem->min_lsn);
 		}
 	}
 }
@@ -2488,7 +2489,7 @@ vy_range_delete(struct vy_range *range)
  *
  * We only dump sealed in-memory indexes and skip the active
  * one in order not to conflict with concurrent insertions.
- * The caller is supposed to freeze the active mem for it to
+ * The caller is supposed to seal the active mem for it to
  * be dumped.
  *
  * @dump_lsn is the maximal LSN to dump. Only in-memory trees
@@ -2800,7 +2801,7 @@ vy_range_needs_coalesce(struct vy_range *range, struct vy_range **p_first,
 	struct vy_range *it;
 
 	/* Size of the coalesced range. */
-	uint64_t total_size = range->size + range->used;
+	uint64_t total_size = range->size + range->mem_used;
 	/* Coalesce ranges until total_size > max_size. */
 	uint64_t max_size = index->index_def->opts.range_size / 2;
 
@@ -2815,7 +2816,7 @@ vy_range_needs_coalesce(struct vy_range *range, struct vy_range **p_first,
 	for (it = vy_range_tree_next(&index->tree, range);
 	     it != NULL && !vy_range_is_scheduled(it);
 	     it = vy_range_tree_next(&index->tree, it)) {
-		uint64_t size = it->size + it->used;
+		uint64_t size = it->size + it->mem_used;
 		if (total_size + size > max_size)
 			break;
 		total_size += size;
@@ -2824,7 +2825,7 @@ vy_range_needs_coalesce(struct vy_range *range, struct vy_range **p_first,
 	for (it = vy_range_tree_prev(&index->tree, range);
 	     it != NULL && !vy_range_is_scheduled(it);
 	     it = vy_range_tree_prev(&index->tree, it)) {
-		uint64_t size = it->size + it->used;
+		uint64_t size = it->size + it->mem_used;
 		if (total_size + size > max_size)
 			break;
 		total_size += size;
@@ -3090,17 +3091,17 @@ vy_range_set(struct vy_range *range, struct vy_mem *mem,
 	if (was_empty)
 		vy_scheduler_add_mem(scheduler, mem);
 
-	if (range->used == 0) {
-		range->min_lsn = lsn;
+	if (range->mem_used == 0) {
+		range->mem_min_lsn = lsn;
 		vy_scheduler_update_range(scheduler, range);
 	}
 
 	assert(mem->min_lsn <= lsn);
-	assert(range->min_lsn <= lsn);
+	assert(range->mem_min_lsn <= lsn);
 
 	size_t size = tuple_size(stmt);
-	range->used += size;
-	index->used += size;
+	range->mem_used += size;
+	index->mem_used += size;
 	index->stmt_count++;
 
 	return 0;
@@ -3496,7 +3497,7 @@ vy_task_dump_complete(struct vy_task *task)
 	vy_write_iterator_delete(task->wi);
 
 	vy_index_unacct_range(index, range);
-	vy_range_dump_mems(range, scheduler, task->dump_lsn);
+	vy_range_gc_mem(range, scheduler, task->dump_lsn);
 	if (range->new_run != NULL) {
 		range->max_dump_size = MAX(range->max_dump_size,
 					   vy_run_size(range->new_run));
@@ -3753,10 +3754,10 @@ vy_task_split_abort(struct vy_task *task, bool in_shutdown)
 
 		vy_range_seal_mem(r);
 		rlist_splice(&range->sealed, &r->sealed);
-		if (range->used == 0)
-			range->min_lsn = r->min_lsn;
-		assert(range->min_lsn <= r->min_lsn);
-		range->used += r->used;
+		if (range->mem_used == 0)
+			range->mem_min_lsn = r->mem_min_lsn;
+		assert(range->mem_min_lsn <= r->mem_min_lsn);
+		range->mem_used += r->mem_used;
 
 		rlist_del(&r->split_list);
 		assert(r->shadow == range);
@@ -3937,11 +3938,11 @@ vy_task_coalesce_complete(struct vy_task *task)
 	it = task->coalesce_begin;
 	while(it != task->coalesce_end) {
 		vy_index_unacct_range(index, it);
-		vy_range_dump_mems(it, scheduler, task->dump_lsn);
+		vy_range_gc_mem(it, scheduler, task->dump_lsn);
 		vy_range_seal_mem(it);
 		rlist_splice(&result->sealed, &it->sealed);
-		result->min_lsn = MIN(result->min_lsn, it->min_lsn);
-		result->used += it->used;
+		result->mem_min_lsn = MIN(result->mem_min_lsn, it->mem_min_lsn);
+		result->mem_used += it->mem_used;
 		struct vy_range *next = vy_range_tree_next(&index->tree, it);
 		vy_index_remove_range(index, it);
 		vy_range_delete(it);
@@ -4109,7 +4110,7 @@ vy_task_compact_complete(struct vy_task *task)
 	 * Replace compacted mems and runs with the resulting run.
 	 */
 	vy_index_unacct_range(index, range);
-	vy_range_dump_mems(range, scheduler, task->dump_lsn);
+	vy_range_gc_mem(range, scheduler, task->dump_lsn);
 	n = task->run_count;
 	rlist_foreach_entry_safe(run, &range->runs, in_range, tmp) {
 		vy_range_remove_run(range, run);
@@ -4256,7 +4257,7 @@ heap_dump_less(struct heap_node *a, struct heap_node *b)
 	struct vy_range *right = container_of(b, struct vy_range, in_dump);
 
 	/* Older ranges are dumped first. */
-	return left->min_lsn < right->min_lsn;
+	return left->mem_min_lsn < right->mem_min_lsn;
 }
 
 #define HEAP_LESS(h, l, r) heap_dump_less(l, r)
@@ -4506,7 +4507,7 @@ retry:
 	if (pn == NULL)
 		return 0; /* nothing to do */
 	struct vy_range *range = container_of(pn, struct vy_range, in_dump);
-	if (range->used == 0)
+	if (range->mem_used == 0)
 		return 0; /* nothing to do */
 	int64_t dump_lsn = INT64_MAX;
 	if (scheduler->checkpoint_lsn != -1) {
@@ -4516,7 +4517,7 @@ retry:
 		 * the WAL checkpoint.
 		 */
 		dump_lsn = scheduler->checkpoint_lsn;
-		if (range->min_lsn > dump_lsn)
+		if (range->mem_min_lsn > dump_lsn)
 			return 0;
 	} else {
 		if (!vy_quota_is_exceeded(&scheduler->env->quota))
@@ -5158,7 +5159,7 @@ vy_index_info(struct vy_index *index, struct info_handler *h)
 	info_begin(h);
 	info_append_u64(h, "range_size", index->index_def->opts.range_size);
 	info_append_u64(h, "page_size", index->index_def->opts.page_size);
-	info_append_u64(h, "memory_used", index->used);
+	info_append_u64(h, "memory_used", index->mem_used);
 	info_append_u64(h, "size", index->size);
 	info_append_u64(h, "count", index->stmt_count);
 	info_append_u32(h, "page_count", index->page_count);
@@ -5615,7 +5616,7 @@ vy_index_delete(struct vy_index *index)
 size_t
 vy_index_bsize(struct vy_index *index)
 {
-	return index->used;
+	return index->mem_used;
 }
 
 /** {{{ Upsert */
@@ -7146,7 +7147,7 @@ vy_env_quota_timer_cb(ev_loop *loop, ev_timer *timer, int events)
 	if (pn != NULL) {
 		struct vy_range *range = container_of(pn, struct vy_range,
 						      in_dump);
-		max_range_size = range->used;
+		max_range_size = range->mem_used;
 	}
 
 	vy_quota_update_watermark(&e->quota, max_range_size,
@@ -8176,21 +8177,21 @@ vy_merge_iterator_restore(struct vy_merge_iterator *itr,
  * Thus we can:
  * 1) Completely skip the resultant statement from output if it's
  *    a DELETE.
- *     ┃      ...      ┃       ┃     ...      ┃
- *     ┃               ┃       ┃              ┃    ↑
- *     ┣━ oldest vlsn ━┫   =   ┣━ oldest lsn ━┫    ↑ lsn
- *     ┃               ┃       ┗━━━━━━━━━━━━━━┛    ↑
- *     ┃    DELETE     ┃
- *     ┃      ...      ┃
+ *     |      ...      |       |     ...      |
+ *     |               |       |              |    ^
+ *     +- oldest vlsn -+   =   +- oldest lsn -+    ^ lsn
+ *     |               |       |              |    ^
+ *     |    DELETE     |       +--------------+
+ *     |      ...      |
  * 2) Replace an accumulated resultant UPSERT with an appropriate
  *    REPLACE.
- *     ┃      ...      ┃       ┃     ...      ┃
- *     ┃     UPSERT    ┃       ┃   REPLACE    ┃    ↑
- *     ┃               ┃       ┃              ┃    ↑
- *     ┣━ oldest vlsn ━┫   =   ┣━ oldest lsn ━┫    ↑ lsn
- *     ┃               ┃       ┗━━━━━━━━━━━━━━┛    ↑
- *     ┃    DELETE     ┃
- *     ┃      ...      ┃
+ *     |      ...      |       |     ...      |
+ *     |     UPSERT    |       |   REPLACE    |
+ *     |               |       |              |    ^
+ *     +- oldest vlsn -+   =   +- oldest lsn -+    ^ lsn
+ *     |               |       |              |    ^
+ *     |    DELETE     |       +--------------+
+ *     |      ...      |
  */
 struct vy_write_iterator {
 	/** Vinyl environment. */
