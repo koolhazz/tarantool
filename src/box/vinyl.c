@@ -439,6 +439,68 @@ struct vy_run {
 };
 
 /**
+ * List of infiniruns, intersected with a range.
+ */
+#define INFINIRUNS_LIST_MAX 10
+struct vy_infiniruns_list {
+	struct rlist run_lists;
+	int used;
+	struct vy_run *infiniruns[0];
+};
+
+static inline void
+vy_infiniruns_list_create(struct vy_infiniruns_list *list)
+{
+	memset(list, 0, sizeof(*list) +
+	       INFINIRUNS_LIST_MAX * sizeof(struct vy_run *));
+	rlist_create(&list->runs);
+}
+
+static inline struct vy_infiniruns_list *
+vy_infiniruns_list_new()
+{
+	static const int size = sizeof(struct vy_infiniruns_list) +
+				INFINIRUNS_LIST_MAX * sizeof(struct vy_run *);
+	struct vy_infiniruns_list *list =
+		(struct vy_infiniruns_list *) malloc(size);
+	if (list == NULL)
+		diag_set(OutOfMemory, size, "malloc", "list");
+	else
+		vy_infiniruns_list_create(list);
+	return list;
+}
+
+static inline int
+vy_infiniruns_list_append_run(struct vy_infiniruns_list *head,
+			      struct vy_run *infinirun)
+{
+	struct vy_infiniruns_list *newest =
+		rlist_first_entry(&head->run_lists, struct vy_infiniruns_list,
+				  run_lists);
+	if (newest->used + 1 >= INFINIRUNS_LIST_MAX) {
+		/*
+		 * Slow way - it is needed to allocate a new chunk
+		 * for infiniruns.
+		 */
+		newest = vy_infiniruns_list_new();
+		if (newest == NULL)
+			return -1;
+		rlist_add_entry(&head->run_lists, newest, run_lists);
+	}
+	/* Fast way - there is free space for the new run. */
+	newest->infiniruns[newest->used++] = infinirun;
+	return 0;
+}
+
+static inline int
+vy_merge_sort_infinirun_lists(struct vy_infiniruns_list **sources, int count,
+			      struct vy_infiniruns_list *dst)
+{
+	
+	return 0;
+}
+
+/**
  * The interval of statements with keys in
  * [ begin, end ) - including 'begin', but not including 'end'.
  */
@@ -456,6 +518,8 @@ struct vy_range {
 	struct vy_index *index;
 	/* Size of data stored on disk (sum of run->info.size). */
 	uint64_t size;
+	/** List of intersected and not compacted infiniruns. */
+	struct vy_infiniruns_list infiniruns;
 	/** New run created for dump/compaction. */
 	struct vy_run *new_run;
 	/**
@@ -3966,12 +4030,16 @@ vy_task_dump_execute(struct vy_task *task)
  *        statements dumped in this range.
  * @param scheduler Scheduler.
  */
-static inline void
+static inline int
 vy_update_range_with_dumped_pages(struct vy_range *range,
+				  struct vy_run *infinirun,
 				  uint64_t range_est_dump_size,
 				  uint32_t range_est_dumped_statements,
 				  struct vy_scheduler *scheduler)
 {
+	if (vy_infiniruns_list_append_run(&range->infiniruns, infinirun) != 0)
+		return -1;
+	vy_run_ref(infinirun);
 	range->max_dump_size = MAX(range->max_dump_size, range_est_dump_size);
 	range->level_zero_run_count++;
 	range->index->total_level_zero_run_count++;
@@ -3981,6 +4049,7 @@ vy_update_range_with_dumped_pages(struct vy_range *range,
 		vy_range_update_compact_priority(range);
 		vy_scheduler_update_range(scheduler, range);
 	}
+	return 0;
 }
 
 static int
@@ -4080,9 +4149,11 @@ vy_task_dump_complete(struct vy_task *task)
 		 * The current range updating is finished. Try to
 		 * get the next range.
 		 */
-		vy_update_range_with_dumped_pages(range, est_dump_size,
-						  est_dumped_statements,
-						  scheduler);
+		if (vy_update_range_with_dumped_pages(range, new_run,
+						      est_dump_size,
+						      est_dumped_statements,
+						      scheduler) != 0)
+			goto err_update_prio;
 		est_dumped_statements = 0;
 		est_dump_size = 0;
 		while(range->end != NULL) {
@@ -4094,22 +4165,30 @@ vy_task_dump_complete(struct vy_task *task)
 			 * page in all intersected ranges.
 			 */
 			if (range->end != NULL &&
-			    key_compare(range->end, next_page_begin, def) <= 0)
-				vy_update_range_with_dumped_pages(range,
-								  page->size,
-								  page->count,
-								  scheduler);
+			    key_compare(range->end, next_page_begin,
+					def) <= 0 &&
+			    vy_update_range_with_dumped_pages(range, new_run,
+							      page->size,
+							      page->count,
+							      scheduler) != 0)
+				goto err_update_prio;
 		}
 		assert(range != NULL);
 	}
 	/* Update the last range. */
 	if (est_dump_size != 0) {
 		assert(est_dumped_statements != 0);
-		vy_update_range_with_dumped_pages(range, est_dump_size,
-						  est_dumped_statements,
-						  scheduler);
+		if (vy_update_range_with_dumped_pages(range, new_run,
+						      est_dump_size,
+						      est_dumped_statements,
+						      scheduler) != 0)
+			goto err_update_prio;
 	}
 	vy_index_info_ranges(index);
+	return 0;
+err_update_prio:
+	say_warn("%s failed to update compact priority of the ranges from %s",
+		 index->name, vy_range_str(range));
 	return 0;
 }
 
@@ -4285,32 +4364,79 @@ select_all_from_index(struct vy_index *index) {
 
 #endif
 
-/** Delete all fully compacted infiniruns. */
+/** After range compaction unref compacted infiniruns. */
 static void
-vy_delete_compacted_infiniruns(struct vy_index *index)
+vy_range_gc_compacted_infiniruns(struct vy_range *range)
 {
-	struct heap_node *pn = vy_max_lsn_heap_top(&index->max_lsn_heap);
-	if (pn == NULL)
+	struct vy_infiniruns_list *chunk =
+		rlist_last_entry(&range->infiniruns, struct vy_infiniruns_list,
+				 run_lists);
+	assert(chunk->used > 0 || chunk == &range->infiniruns);
+	if (chunk->used == 0)
 		return;
-	struct vy_range *range = container_of(pn, struct vy_range, in_max_lsn);
-	int64_t purge_max_lsn = range->compact_max_lsn;
+	int compacted_chunks = 0, compacted_in_chunk;
+	struct vy_index *index = range->index;
 	struct vy_range *infinirange = index->infinirange;
-	struct vy_run *oldest_infinirun =
-		rlist_last_entry(&infinirange->runs, struct vy_run, in_range);
 	vy_log_tx_begin();
-	while (oldest_infinirun->info.max_lsn <= purge_max_lsn) {
-		vy_log_delete_run(oldest_infinirun->id);
-		vy_range_remove_run(infinirange, oldest_infinirun);
-		vy_index_unacct_run(index, oldest_infinirun);
-		vy_run_unref(oldest_infinirun);
-		if (rlist_empty(&infinirange->runs))
-			break;
-		oldest_infinirun = rlist_last_entry(&infinirange->runs,
-						    struct vy_run, in_range);
+	/* From oldest to newest. */
+	rlist_foreach_entry_reverse(chunk, &range->infiniruns, run_lists) {
+		compacted_chunks++;
+		for (compacted_in_chunk = 0; compacted_in_chunk < chunk->used;
+		     ++compacted_in_chunk) {
+			struct vy_run *run =
+				chunk->infiniruns[compacted_in_chunk];
+			if (run->info.max_lsn > range->compact_max_lsn)
+				goto end_of_gc;
+			/*
+			 * One ref by infinirange and one by the
+			 * current chunk. Delete both.
+			 */
+			assert(run->refs >= 2);
+			/* Unref by chunk. */
+			vy_run_unref(run);
+			if (run->refs > 1)
+				continue;
+
+			assert(run->refs == 1);
+			vy_log_delete_run(run->id);
+			vy_range_remove_run(infinirange, run);
+			vy_index_unacct_run(range->index, run);
+			/* Unref by infinirange. */
+			vy_run_unref(run);
+		}
+		chunk->used -= compacted_in_chunk;
 	}
+end_of_gc:
 	if (vy_log_tx_commit() != 0)
 		say_warn("%s: failed to delete unused infiniruns", index->name);
-	vy_index_info_ranges(index);
+	/*
+	 * Free empty chunks and update oldest not empty chunk.
+	 */
+	int i = 0;
+	chunk = rlist_last_entry(&range->infiniruns, struct vy_infiniruns_list,
+				 run_lists);
+	while (i < compacted_chunks) {
+		++i;
+		if (chunk->used == 0 && chunk != &range->infiniruns) {
+			rlist_del_entry(chunk, run_lists);
+			free(chunk);
+			chunk = rlist_last_entry(&range->infiniruns,
+						 struct vy_infiniruns_list,
+						 run_lists);
+		} else if (chunk->used > 0) {
+			/*
+			 * Move runs to the beginning of the
+			 * chunk.
+			 * +---------------+    +---------------+
+			 * |    --runs--   | -> |--runs--       |
+			 * +---------------+    +---------------+
+			 */
+			assert(i == compacted_chunks);
+			memove(chunk->infiniruns,
+			       chunk->infiniruns + compacted_in_chunk,
+			       sizeof(struct vy_run *) * chunk->used);
+		}
+	}
 }
 
 static int
@@ -4378,8 +4504,8 @@ vy_task_split_complete(struct vy_task *task)
 	}
 	index->version++;
 	index->total_level_zero_run_count -= range->level_zero_run_count;
+	vy_range_gc_compacted_infiniruns(range);
 	vy_range_delete(range);
-	vy_delete_compacted_infiniruns(index);
 	return 0;
 }
 
