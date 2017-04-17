@@ -19,11 +19,15 @@ _ = new_seeks()
 
 for i = 1,1000 do s:select{i} end
 new_reflects() == 0
+new_reflects()
 new_seeks() == 1000
+new_seeks()
 
 for i = 1001,2000 do s:select{i} end
 new_reflects() > 980
+new_reflects()
 new_seeks() < 20
+new_seeks()
 
 test_run:cmd('restart server default')
 
@@ -40,10 +44,14 @@ _ = new_seeks()
 
 for i = 1,1000 do s:select{i} end
 new_reflects() == 0
+new_reflects()
 new_seeks() == 1000
+new_seeks()
 
 for i = 1001,2000 do s:select{i} end
 new_reflects() > 980
+new_reflects()
 new_seeks() < 20
+new_seeks()
 
 s:drop()
