@@ -1936,7 +1936,7 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 
 	if (run_info->count == 0) {
 		/* See comment to run_info->max_key allocation below. */
-		region_key = tuple_extract_key(*curr_stmt, key_def, NULL);
+		region_key = key_def->tuple_extract_key(*curr_stmt, key_def, NULL);
 		if (region_key == NULL)
 			goto error_page_index;
 		assert(run_info->min_key == NULL);
@@ -1990,7 +1990,7 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 		 * than a fiber. To reach this, we must copy the
 		 * key into malloced memory.
 		 */
-		region_key = tuple_extract_key(stmt, key_def, NULL);
+		region_key = key_def->tuple_extract_key(stmt, key_def, NULL);
 		if (region_key == NULL)
 			goto error_rollback;
 		assert(run_info->max_key == NULL);
@@ -6155,7 +6155,7 @@ vy_insert_primary(struct vy_tx *tx, struct vy_index *pk, struct tuple *stmt)
 	struct index_def *def = pk->index_def;
 	const char *key;
 	assert(def->iid == 0);
-	key = tuple_extract_key(stmt, &def->key_def, NULL);
+	key = def->key_def.tuple_extract_key(stmt, &def->key_def, NULL);
 	if (key == NULL)
 		return -1;
 	/*
@@ -6192,7 +6192,7 @@ vy_insert_secondary(struct vy_tx *tx, struct vy_index *index,
 	 */
 	if (index->user_index_def->opts.is_unique) {
 		uint32_t key_len;
-		const char *key = tuple_extract_key(stmt, &def->key_def,
+		const char *key = def->key_def.tuple_extract_key(stmt, &def->key_def,
 						    &key_len);
 		if (key == NULL)
 			return -1;
@@ -6239,7 +6239,8 @@ vy_replace_one(struct vy_tx *tx, struct space *space,
 	 */
 	if (stmt != NULL && !rlist_empty(&space->on_replace)) {
 		const char *key;
-		key = tuple_extract_key(new_tuple, &def->key_def, NULL);
+		key = def->key_def.tuple_extract_key(new_tuple,
+				&def->key_def, NULL);
 		if (key == NULL)
 			goto error_unref;
 		uint32_t part_count = mp_decode_array(&key);
@@ -6292,7 +6293,8 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 				       request->tuple_end);
 	if (new_stmt == NULL)
 		return -1;
-	const char *key = tuple_extract_key(new_stmt, &def->key_def, NULL);
+	const char *key = def->key_def.tuple_extract_key(new_stmt,
+						&def->key_def, NULL);
 	if (key == NULL) /* out of memory */
 		goto error;
 	uint32_t part_count = mp_decode_array(&key);
@@ -6411,7 +6413,7 @@ vy_index_full_by_stmt(struct vy_tx *tx, struct vy_index *index,
 	uint32_t size;
 	const char *tuple = tuple_data_range(partial, &size);
 	const char *tuple_end = tuple + size;
-	const char *pkey = tuple_extract_key_raw(tuple, tuple_end,
+	const char *pkey = to_pk->key_def.tuple_extract_key_raw(tuple, tuple_end,
 						 &to_pk->key_def, NULL);
 	if (pkey == NULL)
 		return -1;
@@ -6812,7 +6814,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	 *   to delete old tuples from secondary indexes.
 	 */
 	/* Find the old tuple using the primary key. */
-	key = tuple_extract_key_raw(tuple, tuple_end, &pk_def->key_def, NULL);
+	key = pk_def->key_def.tuple_extract_key_raw(tuple, tuple_end, &pk_def->key_def, NULL);
 	if (key == NULL)
 		return -1;
 	part_count = mp_decode_array(&key);
