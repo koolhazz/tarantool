@@ -1966,7 +1966,7 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 		if (vy_run_dump_stmt(stmt, data_xlog, page,
 				     key_def, is_primary) != 0)
 			goto error_rollback;
-		bloom_spectrum_add(bs, tuple_hash(stmt, user_key_def));
+		bloom_spectrum_add(bs, user_key_def->tuple_hash(stmt, user_key_def));
 
 		if (vy_write_iterator_next(wi, curr_stmt))
 			goto error_rollback;

@@ -1047,9 +1047,9 @@ vy_run_iterator_start(struct vy_run_iterator *itr, struct tuple **ret)
 		if (vy_stmt_type(itr->key) == IPROTO_SELECT) {
 			const char *data = tuple_data(itr->key);
 			mp_decode_array(&data);
-			hash = key_hash(data, user_key_def);
+			hash = user_key_def->key_hash(data, user_key_def);
 		} else {
-			hash = tuple_hash(itr->key, user_key_def);
+			hash = user_key_def->tuple_hash(itr->key, user_key_def);
 		}
 		if (!bloom_possible_has(&itr->run->info.bloom, hash)) {
 			itr->search_ended = true;
